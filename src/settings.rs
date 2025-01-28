@@ -37,9 +37,9 @@ impl Default for Settings {
         Settings {
             display_fahrenheit: false,
             display_graph: false,
-            refresh_processes_rate: 1500,
-            refresh_system_rate: 2000,
-            refresh_network_rate: 1500,
+            refresh_processes_rate: 150000,
+            refresh_system_rate: 200000,
+            refresh_network_rate: 150000,
         }
     }
 }
