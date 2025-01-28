@@ -1,11 +1,11 @@
-use gtk::glib;
+use gtk::{glib, gio};
 use gtk::prelude::*;
 
 use sysinfo::{Pid, Process};
 
 use crate::utils::format_number;
 
-use std::cell::Cell;
+use std::cell::{Cell, Ref};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::rc::Rc;
@@ -13,6 +13,7 @@ use std::rc::Rc;
 #[allow(dead_code)]
 pub struct Procs {
     pub left_tree: gtk::TreeView,
+    pub column_view: gtk::ColumnView,
     pub scroll: gtk::ScrolledWindow,
     pub current_pid: Rc<Cell<Option<Pid>>>,
     pub kill_button: gtk::Button,
@@ -24,10 +25,33 @@ pub struct Procs {
     pub search_bar: gtk::SearchBar,
 }
 
+struct ProcRow {
+    // The first four columns of the model are going to be visible in the view.
+    pid: u32,
+    name: String,
+    cpu: String,
+    mem: String,
+    diskio: String,
+    // These two will serve as keys when sorting by process name and CPU usage.
+    name_lowercase: String,
+    cpu_f32: f32,
+    mem_u64: u64,
+    diskio_f64: u64,
+}
+
 impl Procs {
     pub fn new(proc_list: &HashMap<Pid, Process>, stack: &gtk::Stack) -> Procs {
+
         let left_tree = gtk::TreeView::builder().headers_visible(true).build();
-        let scroll = gtk::ScrolledWindow::builder().child(&left_tree).build();
+
+        let column_view = gtk::ColumnView::builder().build();
+
+        let grid = gtk::Grid::builder().hexpand(true).column_homogeneous(true).build();
+        grid.attach(&column_view, 0, 0, 1, 1);
+        grid.attach(&left_tree, 0, 1, 1, 1);
+
+        let scroll = gtk::ScrolledWindow::builder().child(&grid).build();
+
         let current_pid = Rc::new(Cell::new(None));
         let kill_button = gtk::Button::builder()
             .label("End task")
@@ -64,6 +88,82 @@ impl Procs {
         overlay.add_overlay(&search_bar);
 
         let mut columns: Vec<gtk::TreeViewColumn> = Vec::new();
+
+        let glist_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        for pro in proc_list.values() {
+            if let Some(exe) = pro
+                .exe()
+                .and_then(|exe| exe.file_name())
+                .or_else(|| Some(pro.name()))
+            {
+                gcreate_and_fill_model(
+                    &glist_store,
+                    pro.pid().as_u32(),
+                    pro.cmd(),
+                    exe,
+                    pro.cpu_usage(),
+                    pro.memory(),
+                );
+            }
+        }
+
+
+
+        let sel = gtk::SingleSelection::new(Some(glist_store));
+        column_view.set_model(Some(&sel));
+
+
+        let fpid = gtk::SignalListItemFactory::new();
+        fpid.connect_bind(move |_factory, item| {
+            let obj = get_row (item);
+            let row: Ref<ProcRow> = obj.borrow();
+            item.set_child(Some(&gtk::Label::new(Some( &format!("{}", &row.pid )))));
+        });
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("pid"), Some(fpid)));
+
+
+        let fname = gtk::SignalListItemFactory::new();
+        fname.connect_bind(move |_factory, item| {
+            let obj = get_row (item);
+            let row: Ref<ProcRow> = obj.borrow();
+            item.set_child(Some(&gtk::Label::new(Some( &row.name ))));
+        });
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("process name"), Some(fname)));
+
+
+        let fcpu = gtk::SignalListItemFactory::new();
+        fcpu.connect_bind(move |_factory, item| {
+            let obj = get_row (item);
+            let row: Ref<ProcRow> = obj.borrow();
+            item.set_child(Some(&gtk::Label::new(Some( &row.cpu ))));
+        });
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("cpu usage"), Some(fcpu)));
+
+
+        let fmem = gtk::SignalListItemFactory::new();
+        fmem.connect_bind(move |_factory, item| {
+            let obj = get_row (item);
+            let row: Ref<ProcRow> = obj.borrow();
+            item.set_child(Some(&gtk::Label::new(Some( &row.mem ))));
+        });
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("memory usage"), Some(fmem)));
+
+
+
+        let fio = gtk::SignalListItemFactory::new();
+        fio.connect_bind(move |_factory, item| {
+            let obj = get_row (item);
+            let row: Ref<ProcRow> = obj.borrow();
+            item.set_child(Some(&gtk::Label::new(Some( &row.mem ))));
+        });
+        #[cfg(not(windows))]
+        {
+            column_view.append_column(&gtk::ColumnViewColumn::new(Some("disk I/O usage"), Some(fio)));
+        }
+        #[cfg(windows)]
+        {
+            column_view.append_column(&gtk::ColumnViewColumn::new(Some("I/O usage"), Some(fio)));
+        }
 
         let list_store = gtk::ListStore::new(&[
             // The first four columns of the model are going to be visible in the view.
@@ -193,6 +293,7 @@ impl Procs {
 
         Procs {
             left_tree,
+            column_view,
             scroll,
             current_pid,
             kill_button,
@@ -273,4 +374,48 @@ pub fn create_and_fill_model(
             (8, &0),
         ],
     );
+}
+
+pub fn gcreate_and_fill_model(
+    glist_store: &gio::ListStore,
+    pid: u32,
+    cmdline: &[OsString],
+    name: &OsStr,
+    cpu: f32,
+    memory: u64,
+) {
+    let name = if name.is_empty() {
+        let Some(cmd) = cmdline
+            .iter()
+            .map(|c| c.to_string_lossy().to_string())
+            .next()
+        else {
+            return;
+        };
+        cmd
+    } else {
+        name.to_string_lossy().to_string()
+    };
+    glist_store.append(&glib::BoxedAnyObject::new(ProcRow{
+        pid: pid,
+        name: name.clone(),
+        cpu: format!("{:.1}", cpu),
+        mem: format_number(memory),
+        diskio: String::new(),
+        name_lowercase: name.to_lowercase(),
+        cpu_f32: cpu,
+        mem_u64: memory,
+        diskio_f64: 0,
+    }));
+}
+
+
+pub fn get_row(
+    item: &gtk::ListItem,
+) -> glib::BoxedAnyObject {
+    let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+    let itm = item.item();
+    let fobj = itm.unwrap().downcast::<glib::BoxedAnyObject>();
+    let obj = fobj.unwrap();
+    return obj;
 }
